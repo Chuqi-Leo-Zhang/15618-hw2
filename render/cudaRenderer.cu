@@ -17,6 +17,21 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+# define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"CUDA Error: %s at %s: %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -61,6 +76,14 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+
+#define TILE_H 32
+#define TILE_W 32
+#define CIRCLES_PER_CHUNK 128
+
+#define SCAN_BLOCK_DIM 256
+
+#include "exclusiveScan.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -433,6 +456,358 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+__device__ __forceinline__ int clamp(int val, int minVal, int maxVal)
+{
+    return (val < minVal) ? minVal : ((val > maxVal) ? maxVal : val);
+}
+
+
+__global__ void kernelTileCounts(
+    int tilesX, int tilesY,
+    int* __restrict__ tileCounts)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= cuConstRendererParams.numberOfCircles)
+        return;
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[3 * idx]);
+    float r = cuConstRendererParams.radius[idx];
+    int imageW = cuConstRendererParams.imageWidth;
+    int imageH = cuConstRendererParams.imageHeight;
+
+    int minX = static_cast<int>(floorf(imageW * (p.x - r)));
+    int maxX = static_cast<int>(ceilf(imageW * (p.x + r)));
+    int minY = static_cast<int>(floorf(imageH * (p.y - r)));
+    int maxY = static_cast<int>(ceilf(imageH * (p.y + r)));
+
+    int txmin = clamp(minX / TILE_W, 0, tilesX - 1);
+    int txmax = clamp(maxX / TILE_W, 0, tilesX - 1);
+    int tymin = clamp(minY / TILE_H, 0, tilesY - 1);
+    int tymax = clamp(maxY / TILE_H, 0, tilesY - 1);
+
+    for (int ty = tymin; ty <= tymax; ty++) {
+        int base = ty * tilesX;
+        for (int tx = txmin; tx <= txmax; tx++) {
+            atomicAdd(&tileCounts[base + tx], 1);
+        }
+    }
+}
+
+
+__global__ void kernelSortedTileList(
+    int tilesX, int tilesY, int numCircles,
+    const int* __restrict__ tileOffsets,
+    int* __restrict__ tileCounts,
+    int* __restrict__ tileList)
+{
+    const int b = blockIdx.x;
+    if (b >= tilesX * tilesY) return;
+    const int tx = threadIdx.x;
+
+    const int imageW = cuConstRendererParams.imageWidth;
+    const int imageH = cuConstRendererParams.imageHeight;
+    const int bx = b % tilesX;
+    const int by = b / tilesX;
+    const float minx = bx * TILE_W;
+    const float maxx = fminf((bx + 1) * TILE_W, (float)imageW);
+    const float miny = by * TILE_H;
+    const float maxy = fminf((by + 1) * TILE_H, (float)imageH);
+
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+    __shared__ int tempCount;
+
+    int base = 0;
+    for (int cbase = 0; cbase < numCircles; cbase += SCAN_BLOCK_DIM) {
+        const int c = cbase + tx;
+
+        uint flag = 0u;
+        if (c < numCircles) {
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * c]);
+            float r = cuConstRendererParams.radius[c];
+
+            const float cx = imageW * p.x;
+            const float cy = imageH * p.y;
+            const float cr = imageW * r;
+
+            float nx = fminf(fmaxf(cx, minx), maxx);
+            float ny = fminf(fmaxf(cy, miny), maxy);
+            float dx = cx - nx, dy = cy - ny;
+            if (dx*dx + dy*dy <= cr*cr) flag = 1u;
+        }
+
+        prefixSumInput[tx] = flag;
+        __syncthreads();
+
+        sharedMemExclusiveScan(tx, prefixSumInput, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+
+        if (tx == SCAN_BLOCK_DIM - 1) {
+            tempCount = (int)(prefixSumOutput[tx] + prefixSumInput[tx]);
+        }
+        if (flag) {
+            tileList[tileOffsets[b] + base + (int)prefixSumOutput[tx]] = c;
+        }
+        __syncthreads();
+
+        base += tempCount;
+        __syncthreads();
+
+    }
+
+    if (tx == 0) {
+        tileCounts[b] = base;
+    }
+}
+
+
+__global__ void kernelTilingRender(
+    int tilesX, int tilesY,
+    const int* __restrict__ tileOffsets,
+    const int* __restrict__ tileCounts,
+    const int* __restrict__ tileList,
+    const int* __restrict__ tileActive,
+    int isSnowflake)
+{
+    const int t = tileActive[blockIdx.x];
+    const int bx = t % tilesX;
+    const int by = t / tilesX;
+    if (bx >= tilesX || by >= tilesY) return;
+
+    const int imageW = cuConstRendererParams.imageWidth;
+    const int imageH = cuConstRendererParams.imageHeight;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int px = bx * TILE_W + tx;
+    const int py = by * TILE_H + ty;
+
+    const bool active = (px < imageW) & (py < imageH);
+
+    const int pixelIndex = 4 * (py * imageW + px);
+    float4 img = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (active)
+        img = *(float4*)(&cuConstRendererParams.imageData[pixelIndex]);
+
+    const float2 pc = make_float2((px + 0.5f) / (float)imageW,
+                                  (py + 0.5f) / (float)imageH);
+
+    const int offset = tileOffsets[by * tilesX + bx];
+    const int count = tileCounts[by * tilesX + bx];
+
+    if (count <= 32) {
+        if (px < imageW && py < imageH) {
+            int pixIdx = 4 * (py * imageW + px);
+            float4 img = *(float4*)(&cuConstRendererParams.imageData[pixIdx]);
+            float2 pc = make_float2((px + 0.5f) / (float)imageW,
+                                    (py + 0.5f) / (float)imageH);
+
+            #pragma unroll
+            for (int i = 0; i < count; ++i) {
+                int c = tileList[offset + i];
+                float3 p = *(float3*)(&cuConstRendererParams.position[3*c]);
+                float  r =  cuConstRendererParams.radius[c];
+                float dx = p.x - pc.x, dy = p.y - pc.y;
+                float d2 = dx*dx + dy*dy;
+                if (d2 > r*r) continue;
+
+                float3 rgb; float a;
+                if (isSnowflake) {
+                    const float kA=.5f, falloff=4.f;
+                    float norm = sqrtf(d2)/r;
+                    rgb = lookupColor(norm);
+                    float maxA = kA * fminf(fmaxf(.6f + .4f*(1.f-p.z), 0.f), 1.f);
+                    a = maxA * expf(-falloff*norm*norm);
+                } else {
+                    rgb = *(float3*)(&cuConstRendererParams.color[3*c]);
+                    a   = .5f;
+                }
+                float oma = 1.f - a;
+                img.x = a*rgb.x + oma*img.x;
+                img.y = a*rgb.y + oma*img.y;
+                img.z = a*rgb.z + oma*img.z;
+                img.w = a + img.w;
+            }
+            *(float4*)(&cuConstRendererParams.imageData[pixIdx]) = img;
+        }
+        return;   // skip shared-mem path
+    }
+
+    __shared__ float3 sPos[CIRCLES_PER_CHUNK];
+    __shared__ float  sRad[CIRCLES_PER_CHUNK];
+    __shared__ float3 sCol[CIRCLES_PER_CHUNK];
+
+    const int tid = ty * TILE_W + tx;
+
+    for (int i = 0; i < count; i += CIRCLES_PER_CHUNK) {
+        const int n = min(CIRCLES_PER_CHUNK, count - i);
+
+        if (tid < n) {
+            const int c  = tileList[offset + i + tid];
+            const int i3 = 3 * c;
+            sPos[tid] = *(float3*)(&cuConstRendererParams.position[i3]);
+            sRad[tid] =  cuConstRendererParams.radius[c];
+            if (!isSnowflake)
+                sCol[tid] = *(float3*)(&cuConstRendererParams.color[i3]);
+        }
+        __syncthreads();
+
+        if (active) {
+            for (int j = 0; j < n; j++) {
+                const float dx = sPos[j].x - pc.x;
+                const float dy = sPos[j].y - pc.y;
+                const float d2 = dx*dx + dy*dy;
+                const float r2 = sRad[j] * sRad[j];
+                if (d2 > r2) continue;
+
+                float3 rgb;
+                float  alpha;
+
+                if (isSnowflake) {
+                    const float kCircleMaxAlpha = .5f;
+                    const float falloff        = 4.f;
+                    const float norm           = sqrtf(d2) / sRad[j];
+                    rgb = lookupColor(norm);
+                    float maxA = .6f + .4f * (1.f - sPos[j].z);
+                    maxA = kCircleMaxAlpha * fminf(fmaxf(maxA, 0.f), 1.f);
+                    alpha = maxA * expf(-falloff * norm * norm);
+                } else {
+                    rgb   = sCol[j];
+                    alpha = .5f;
+                }
+
+                const float oneMinusAlpha = 1.f - alpha;
+                img.x = alpha * rgb.x + oneMinusAlpha * img.x;
+                img.y = alpha * rgb.y + oneMinusAlpha * img.y;
+                img.z = alpha * rgb.z + oneMinusAlpha * img.z;
+                img.w = alpha + img.w;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active)
+        *(float4*)(&cuConstRendererParams.imageData[pixelIndex]) = img;
+}
+
+
+__global__ void kernelRenderSmall(
+    int imageW, int imageH, int N)
+{
+    const int px = blockIdx.x * blockDim.x + threadIdx.x;
+    const int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= imageW || py >= imageH) return;
+
+    int pixelIndex = 4 * (py * imageW + px);
+    float4 img = *(float4*)(&cuConstRendererParams.imageData[pixelIndex]);
+
+    const float2 pc = make_float2((px + 0.5f) / (float)imageW,
+                                  (py + 0.5f) / (float)imageH);
+
+    for (int c = 0; c < N; c++) {
+        const float3 p  = *(const float3*)(&cuConstRendererParams.position[3 * c]);
+        const float  r  = cuConstRendererParams.radius[c];
+
+        const float dx = p.x - pc.x;
+        const float dy = p.y - pc.y;
+        const float d2 = dx*dx + dy*dy;
+        if (d2 > r*r) continue;
+
+        float3 rgb = *(const float3*)(&cuConstRendererParams.color[3 * c]);
+        float alpha = .5f;
+
+        const float oneMinusAlpha = 1.f - alpha;
+        img.x = alpha * rgb.x + oneMinusAlpha * img.x;
+        img.y = alpha * rgb.y + oneMinusAlpha * img.y;
+        img.z = alpha * rgb.z + oneMinusAlpha * img.z;
+        img.w = alpha + img.w;
+    }
+
+    *(float4*)(&cuConstRendererParams.imageData[pixelIndex]) = img;
+}
+
+
+// mark tiles that have any circles
+__global__ void kernelMarkActiveTiles(const int* __restrict__ tileCounts,
+                                      int numTiles,
+                                      int* __restrict__ flags) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numTiles) flags[i] = (tileCounts[i] > 0);
+}
+
+// write linear tile indices of active tiles using a scanned offset
+__global__ void kernelBuildActiveTileList(const int* __restrict__ flags,
+                                          const int* __restrict__ offsets,
+                                          int numTiles,
+                                          int* __restrict__ activeTiles) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numTiles && flags[i]) {
+        activeTiles[offsets[i]] = i;   // store linear tile id
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+__global__ void kernelScanBlocks(
+    int* __restrict__ data,
+    int N,
+    int* __restrict__ blockSums)
+{
+    const int tid = threadIdx.x;
+    const int base = blockIdx.x * SCAN_BLOCK_DIM;
+    const int gid = base + tid;
+
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+
+    uint value = (gid < N) ? (uint)data[gid] : 0u;
+    prefixSumInput[tid] = value;
+    __syncthreads();
+
+    sharedMemExclusiveScan(tid, prefixSumInput, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+
+    if (gid < N) {
+        data[gid] = prefixSumOutput[tid];
+    }
+
+    if (tid == SCAN_BLOCK_DIM - 1) {
+        blockSums[blockIdx.x] = (int)(prefixSumOutput[tid] + prefixSumInput[tid]);
+    }
+}
+
+__global__ void kernelAddBlockSums(
+    int* __restrict__ output,
+    int N,
+    const int* __restrict__ blockSumsOffset)
+{
+    const int tid = threadIdx.x;
+    const int base = blockIdx.x * SCAN_BLOCK_DIM;
+    const int gid = base + tid;
+    const int offset = blockSumsOffset[blockIdx.x];
+
+    if (gid < N) {
+        output[gid] += offset;
+    }
+}
+
+static inline void exclusive_scan(int* data, int length)
+{
+    if (length == 0) return;
+
+    const int numBlocks = (length + SCAN_BLOCK_DIM - 1) / SCAN_BLOCK_DIM;
+
+    int* blockSums = NULL;
+    cudaMalloc(&blockSums, sizeof(int) * numBlocks);
+    kernelScanBlocks<<<numBlocks, SCAN_BLOCK_DIM>>>(data, length, blockSums);
+
+    if (numBlocks > 1) {
+        exclusive_scan(blockSums, numBlocks);
+
+        kernelAddBlockSums<<<numBlocks, SCAN_BLOCK_DIM>>>(data, length, blockSums);
+    }
+    cudaFree(blockSums);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -450,6 +825,20 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+
+    tileX = 0;
+    tileY = 0;
+    numTiles = 0;
+    tileLength = 0;
+
+    d_tileCounts = NULL;
+    d_tileOffsets = NULL;
+    d_tileList = NULL;
+
+    d_activeTileFlags = NULL;
+    d_activeTileOffsets = NULL;
+    d_activeTileList = NULL;
+
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -472,6 +861,15 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
     }
+
+    if (d_tileCounts) cudaFree(d_tileCounts);
+    if (d_tileOffsets) cudaFree(d_tileOffsets);
+    if (d_tileList) cudaFree(d_tileList);
+
+    if (d_activeTileFlags) cudaFree(d_activeTileFlags);
+    if (d_activeTileOffsets) cudaFree(d_activeTileOffsets);
+    if (d_activeTileList) cudaFree(d_activeTileList);
+
 }
 
 const Image*
@@ -593,6 +991,12 @@ CudaRenderer::setup() {
 
     cudaMemcpyToSymbol(cuConstColorRamp, lookupTable, sizeof(float) * 3 * COLOR_MAP_SIZE);
 
+    tileX = (image->width + TILE_W - 1) / TILE_W;
+    tileY = (image->height + TILE_H - 1) / TILE_H;
+    numTiles = tileX * tileY;
+
+    if (!d_tileCounts) cudaMalloc(&d_tileCounts, sizeof(int) * numTiles);
+    if (!d_tileOffsets) cudaMalloc(&d_tileOffsets, sizeof(int) * numTiles);
 }
 
 // allocOutputImage --
@@ -651,12 +1055,73 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+
 void
 CudaRenderer::render() {
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    if (numberOfCircles <= 32) {
+        dim3 block(32, 32);
+        dim3 grid((image->width + block.x - 1) / block.x,
+                  (image->height + block.y - 1) / block.y);
+        kernelRenderSmall<<<grid, block>>>(image->width, image->height, numberOfCircles);
+        cudaDeviceSynchronize();
+        return;
+    }
+
+    // tile counts
+    cudaMemset(d_tileCounts, 0, sizeof(int) * numTiles);
+    dim3 blockDim(256, 1, 1);
+    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x, 1, 1);
+    kernelTileCounts<<<gridDim, blockDim>>>(tileX, tileY, d_tileCounts);
+    cudaDeviceSynchronize();
+
+    // exclusive scan
+    cudaMemcpy(d_tileOffsets, d_tileCounts, sizeof(int) * numTiles, cudaMemcpyDeviceToDevice);
+    exclusive_scan(d_tileOffsets, numTiles);
+    cudaDeviceSynchronize();
+
+    int last_offset=0;
+    cudaMemcpy(&last_offset, &d_tileOffsets[numTiles - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int last_count=0;
+    cudaMemcpy(&last_count, &d_tileCounts[numTiles - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int total_counts = last_offset + last_count;
+
+    if (total_counts > tileLength) {
+        if (d_tileList) cudaFree(d_tileList);
+        cudaMalloc(&d_tileList, sizeof(int) * total_counts);
+        tileLength = total_counts;
+    }
+
+    // soreted tile list
+    dim3 blockDim2(numTiles, 1, 1);
+    kernelSortedTileList<<<numTiles, SCAN_BLOCK_DIM>>>(tileX, tileY, numberOfCircles, d_tileOffsets, d_tileCounts, d_tileList);
+    cudaDeviceSynchronize();
+
+    cudaMalloc(&d_activeTileFlags, sizeof(int) * numTiles);
+    cudaMalloc(&d_activeTileOffsets, sizeof(int) * numTiles);
+
+    dim3 blockDim3(256, 1, 1);
+    dim3 gridDim3((numTiles + blockDim3.x - 1) / blockDim3.x, 1, 1);
+    kernelMarkActiveTiles<<<gridDim3, blockDim3>>>(d_tileCounts, numTiles, d_activeTileFlags);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(d_activeTileOffsets, d_activeTileFlags, sizeof(int) * numTiles, cudaMemcpyDeviceToDevice);
+    exclusive_scan(d_activeTileOffsets, numTiles);
+    cudaDeviceSynchronize();
+
+    int last_active_offset = 0;
+    cudaMemcpy(&last_active_offset, &d_activeTileOffsets[numTiles - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int last_active_flag = 0;
+    cudaMemcpy(&last_active_flag, &d_activeTileFlags[numTiles - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int total_active_tiles = last_active_offset + last_active_flag;
+
+    cudaMalloc(&d_activeTileList, sizeof(int) * total_active_tiles);
+    kernelBuildActiveTileList<<<gridDim3, blockDim3>>>(d_activeTileFlags, d_activeTileOffsets, numTiles, d_activeTileList);
+    cudaDeviceSynchronize();
+
+    dim3 blockDim4(TILE_W, TILE_H, 1);
+    dim3 gridDim4(total_active_tiles, 1, 1);
+    bool isSnowflake = (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME);
+    kernelTilingRender<<<gridDim4, blockDim4>>>(tileX, tileY, d_tileOffsets, d_tileCounts, d_tileList, d_activeTileList,isSnowflake);
     cudaDeviceSynchronize();
 }

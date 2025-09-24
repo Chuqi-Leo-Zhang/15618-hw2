@@ -27,6 +27,17 @@ private:
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
 
+    int tileX, tileY;
+    int numTiles;
+    int* d_tileOffsets;
+    int* d_tileCounts;
+    int* d_tileList;
+    int tileLength;
+
+    int* d_activeTileFlags;
+    int* d_activeTileOffsets;
+    int* d_activeTileList;
+
 public:
 
     CudaRenderer();

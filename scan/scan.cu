@@ -29,6 +29,39 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void pad_zeros(int *data, int length, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= length && idx < n) {
+        data[idx] = 0;
+    }
+}
+
+__global__ void upsweep(int *data, int n, int twod, int twod1) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = i * twod1 + twod1 - 1;
+
+    if (idx < n) {
+        data[idx] += data[idx - twod];
+    }
+}
+
+__global__ void set_zero(int *data, int n) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        data[n - 1] = 0;
+    }
+}
+
+__global__ void downsweep(int *data, int n, int twod, int twod1) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = i * twod1 + twod1 - 1;
+
+    if (idx < n) {
+        int t = data[idx - twod];
+        data[idx - twod] = data[idx];
+        data[idx] += t;
+    }
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +76,34 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+    if (length <= 0) {
+        return;
+    }
+
+    const int threadsPerBlock = 256;
+    int n = nextPow2(length);
+
+    {
+        int grid = (n + threadsPerBlock - 1) / threadsPerBlock;
+        pad_zeros<<<grid, threadsPerBlock>>>(device_data, length, n);
+    }
+
+    for (int twod = 1; twod < n; twod <<= 1) {
+        int twod1 = twod << 1;
+        int s = n / twod1;
+        int grid = (s + threadsPerBlock - 1) / threadsPerBlock;
+        upsweep<<<grid, threadsPerBlock>>>(device_data, n, twod, twod1);
+    }
+
+    set_zero<<<1, 1>>>(device_data, n);
+
+    for (int twod = n >> 1; twod >= 1; twod >>= 1) {
+        int twod1 = twod << 1;
+        int s = n / twod1;
+        int grid = (s + threadsPerBlock - 1) / threadsPerBlock;
+        downsweep<<<grid, threadsPerBlock>>>(device_data, n, twod, twod1);
+    }
+
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -108,7 +169,30 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void mark_peaks(const int *input, int length, int *flags) {
 
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int f = 0;
+    if (idx > 0 && idx < length - 1) {
+        int val = input[idx];
+        f = (val > input[idx - 1] && val > input[idx + 1]);
+    }
+
+    if (idx < length) {
+        flags[idx] = f;
+    }
+}
+
+__global__ void scatter_peaks(const int *flags, const int *scan, int length,int *output) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < length && flags[idx]) {
+        int outidx = scan[idx];
+        output[outidx] = idx;
+    }
+}
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -125,7 +209,37 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+
+     const int threadsPerBlock = 256;
+    if (length <= 2) {
+        return 0;
+    }
+
+    int nrounded = nextPow2(length);
+    int *d_flags, *d_scan;
+    cudaMalloc((void **)&d_flags, nrounded * sizeof(int));
+    cudaMalloc((void **)&d_scan, nrounded * sizeof(int));
+
+    {
+        int grid = (length + threadsPerBlock - 1) / threadsPerBlock;
+        mark_peaks<<<grid, 256>>>(device_input, length, d_flags);
+    }
+
+    cudaMemcpy(d_scan, d_flags, length * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(d_scan, length);
+
+    int count = 0;
+    cudaMemcpy(&count, &d_scan[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    
+    {
+        int grid = (length + threadsPerBlock - 1) / threadsPerBlock;
+        scatter_peaks<<<grid, threadsPerBlock>>>(d_flags, d_scan, length, device_output);
+    }
+
+    cudaFree(d_flags);
+    cudaFree(d_scan);
+
+    return count;
 }
 
 
